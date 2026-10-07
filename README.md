@@ -22,6 +22,9 @@ When the job is done you get an honest receipt, counted from what Claude actuall
 
 - **Quick questions stay plain chat.** No plan, no card. Claude only has to plan before it changes something.
 - **"Needs you" says what for**, e.g. "Claude needs your OK to delete something".
+- **Helpers show up too.** When Claude starts a helper (sub-agent), it appears under the step it's working on:
+  `↳ Helper: Research competitor prices   working · 32s`, then `✓ done`. The job isn't "All done" until every
+  helper has reported back, and their file changes count in the receipt.
 - **Show changes** lists every file changed or created, and says plainly when commands ran that could change
   things it can't see.
 - No extra AI calls: names, receipts and prompts are worked out locally.

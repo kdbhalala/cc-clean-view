@@ -253,3 +253,54 @@ test('Needs you says what the OK is for', async ($, on) => {
   await call
   expect(await ui.find({ type: 'Text', text: /Needs you/ })).toBeUndefined()
 })
+
+const AGENT_DONE = { result: { status: 'completed', agentId: 'h1', content: [], totalDurationMs: 1, prompt: '' } }
+
+test('a helper shows under its step while it works, then shows done', async ($, on) => {
+  let release = () => {}
+  const held = new Promise<ToolAnswer>(resolve => { release = () => resolve(AGENT_DONE) })
+  const clock = world(on, () => held)
+  await startPlanned($)
+  const call = $.tool.call({ tool: 'Agent', description: 'Research competitor prices', prompt: 'look around' })
+  await clock.settle()
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount(band(surface))
+    expect(await ui.find({ type: 'Text', text: /Helper: Research competitor prices/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^working · / })).toBeDefined()
+    await ui.unmount()
+  }
+  release()
+  await call
+  const ui = await $.ui.mount(band('terminal'))
+  expect(await ui.find({ type: 'Text', text: '✓ done' })).toBeDefined()
+})
+
+test('a background helper keeps the job going until it reports back', async ($, on) => {
+  world(on, () => ({ result: { status: 'async_launched', agentId: 'bg1', description: 'Write the pricing copy', prompt: '', outputFile: '' } }))
+  await startPlanned($)
+  await $.tool.call({ tool: 'Agent', description: 'Write the pricing copy', prompt: 'write', run_in_background: true })
+  await $.tool.call({ tool: PROGRESS, task: 'Add the contact form', percent: 100 })
+  await $.turn.complete(endTurn('answer'))
+  let ui = await $.ui.mount(band('terminal'))
+  expect(await ui.find({ type: 'Text', text: /All done/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /Helper: Write the pricing copy/ })).toBeDefined()
+  await $.turn.complete({ ...endTurn('answer'), agentId: 'bg1', turnId: 'h-turn' })
+  await $.turn.start({ text: '<task-notification>helper finished</task-notification>', turnId: 't2' })
+  await $.turn.complete(endTurn('answer'))
+  ui = await $.ui.mount(band('terminal'))
+  expect(await ui.find({ type: 'Text', text: /✓ All done · Build my landing page/ })).toBeDefined()
+})
+
+test("a helper's permission prompt says the helper needs your OK", async ($, on) => {
+  let release = () => {}
+  const held = new Promise<ToolAnswer>(resolve => { release = () => resolve({ result: { type: 'create' } }) })
+  const clock = world(on, () => held)
+  await startPlanned($)
+  const call = $.tool.call({ tool: 'Write', file_path: '/Users/me/notes.md', content: 'hi', agentId: 'h7' } as never)
+  await clock.settle()
+  await $.classic.Notification({ message: 'Claude needs your permission to use Write', notification_type: 'permission_prompt' })
+  const ui = await $.ui.mount(band('terminal'))
+  expect(await ui.find({ type: 'Text', text: / Claude's helper needs your OK to save notes.md/ })).toBeDefined()
+  release()
+  await call
+})

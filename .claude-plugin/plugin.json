@@ -1,6 +1,6 @@
 {
   "name": "clean-view",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A calm, plain-English checklist above the prompt; hides tool calls, diffs and command output while Claude works.",
   "types": "./types/index.d.ts",
   "author": {

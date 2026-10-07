@@ -20,6 +20,20 @@ export type CleanViewChanges = {
   commands: number
 }
 
+/** A helper (sub-agent) Claude started, shown under the step it was started for. */
+export type CleanViewHelper = {
+  /** The id of the call that started it. */
+  id: string
+  /** Set once known; a background helper reports back under it. */
+  agentId: string | null
+  name: string
+  status: 'working' | 'done' | 'failed'
+  /** The step it belongs to; null when started before any plan. */
+  taskId: string | null
+  startedAt: number
+  finishedAt: number | null
+}
+
 export type CleanViewChecklist = {
   title: string
   phase: CleanViewPhase
@@ -32,6 +46,7 @@ export type CleanViewChecklist = {
   /** True once Claude laid out a real plan (plan_steps or its to-do list). */
   isPlanned: boolean
   changes: CleanViewChanges
+  helpers: CleanViewHelper[]
   /** The person opened the "Show changes" list. */
   isShowingChanges: boolean
 }

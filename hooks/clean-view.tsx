@@ -1,7 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On, ToolCallInput, ToolCallResult, TurnCompleteInput } from 'claude-code'
 
-import type { CleanViewChanges, CleanViewChecklist, CleanViewPhase, CleanViewTask, CleanViewTaskStatus } from '../types'
+import type {
+  CleanViewChanges, CleanViewChecklist, CleanViewHelper, CleanViewPhase, CleanViewTask, CleanViewTaskStatus,
+} from '../types'
 
 type Engine = EngineInterface
 type Todo = { content: string; status: 'pending' | 'in_progress' | 'completed' }
@@ -37,7 +39,7 @@ const NO_CHANGES: CleanViewChanges = { edited: [], created: [], commands: 0 }
 const IDLE: CleanViewChecklist = {
   title: '', phase: 'idle', tasks: [], needsYouReason: null, stuckReason: null,
   startedAt: null, finishedAt: null, isCollapsed: false, isPlanned: false,
-  changes: NO_CHANGES, isShowingChanges: false,
+  changes: NO_CHANGES, helpers: [], isShowingChanges: false,
 }
 
 const enabledAtom = atom({ plugin: 'clean-view', key: 'cleanViewEnabled' } as const, true)
@@ -50,6 +52,8 @@ let failStreak = 0
 let lastErrorKind: string | undefined
 /** What the newest running tool call would do, in plain words, for a permission prompt it raises. */
 let pendingAsk: string | undefined
+/** Who made that call: Claude itself or one of its helpers. */
+let pendingWho = 'Claude'
 
 // ---------- plain names ----------
 
@@ -119,7 +123,9 @@ function startTurn(c: CleanViewChecklist, text: string, now: number): CleanViewC
   const prompt = text.trim()
   const isReply = c.phase === 'needs-you' && c.isPlanned && hasUnfinished(c)
   if (isReply) return { ...c, phase: 'working', needsYouReason: null, stuckReason: null, finishedAt: null }
-  if (prompt === '' || prompt.startsWith('/')) return c
+  // A turn woken by a helper reporting back (or any system notice) continues the job it belongs to.
+  const isWakeUp = prompt.startsWith('<') || (c.phase === 'working' && hasWorkingHelpers(c))
+  if (prompt === '' || prompt.startsWith('/') || isWakeUp) return c
   const title = shortTitle(prompt)
   return newJob(now, title === 'Working on it' ? 'Your request' : title)
 }
@@ -202,6 +208,8 @@ function endTurn(c: CleanViewChecklist, e: TurnCompleteInput, now: number): Clea
   if (e.reason === 'aborted') {
     return c.phase === 'stuck' && c.stuckReason === SAID_NO ? ended : { ...ended, phase: 'stopped', stuckReason: null }
   }
+  // Helpers still running in the background: the job isn't over, Claude will be woken when they report.
+  if (hasWorkingHelpers(c)) return c
   if (c.isPlanned && hasUnfinished(c)) {
     return { ...c, phase: 'needs-you', needsYouReason: WAITING_REPLY, stuckReason: null }
   }
@@ -217,6 +225,48 @@ function outcomeOf(ran: ToolCallResult, streak: number): Outcome {
   const failed = ran.deny === undefined && ran.isError === true
   const saidNo = failed && /doesn't want to proceed|was rejected|user (denied|rejected)/i.test(String(ran.text ?? ''))
   return { failed, saidNo, streak: failed && !saidNo ? streak + 1 : 0 }
+}
+
+// ---------- helpers (sub-agents) ----------
+
+/** State written before this field existed (it survives reloads) reads as no helpers. */
+const helpersOf = (c: CleanViewChecklist): CleanViewHelper[] => c.helpers ?? []
+
+const hasWorkingHelpers = (c: CleanViewChecklist): boolean => helpersOf(c).some(h => h.status === 'working')
+
+function addHelper(c: CleanViewChecklist, id: string, description: string, now: number): CleanViewChecklist {
+  if (!isActiveJob(c)) return c
+  const helper: CleanViewHelper = {
+    id, agentId: null, name: cleanName(description), status: 'working',
+    taskId: c.tasks.find(t => t.status === 'active')?.id ?? null, startedAt: now, finishedAt: null,
+  }
+  return { ...c, helpers: [...helpersOf(c), helper] }
+}
+
+function updateHelper(
+  c: CleanViewChecklist, matches: (h: CleanViewHelper) => boolean, fn: (h: CleanViewHelper) => CleanViewHelper,
+): CleanViewChecklist {
+  return { ...c, helpers: helpersOf(c).map(h => (matches(h) ? fn(h) : h)) }
+}
+
+/** The Agent call came back: a foreground helper is finished, a background one is now known by its id. */
+function settleHelper(c: CleanViewChecklist, id: string, ran: ToolCallResult, now: number): CleanViewChecklist {
+  const record = ran.result as { status?: string; agentId?: string } | undefined
+  const failed = ran.deny !== undefined || ran.isError === true
+  const isBackground = !failed && record?.status === 'async_launched'
+  return updateHelper(c, h => h.id === id, h => ({
+    ...h,
+    agentId: record?.agentId ?? h.agentId,
+    status: isBackground ? 'working' : failed ? 'failed' : 'done',
+    finishedAt: isBackground ? null : now,
+  }))
+}
+
+/** A helper's own run ended (how a background helper reports back). */
+function finishHelper(c: CleanViewChecklist, agentId: string, reason: string, now: number): CleanViewChecklist {
+  return updateHelper(c, h => h.agentId === agentId && h.status === 'working', h => ({
+    ...h, status: reason === 'answer' ? 'done' : 'failed', finishedAt: now,
+  }))
 }
 
 // ---------- the "what changed" receipt ----------
@@ -457,6 +507,7 @@ export function registerCleanView(on: On): void {
     failStreak = 0
     lastErrorKind = undefined
     pendingAsk = undefined
+    pendingWho = 'Claude'
     return next(e)
   })
 
@@ -483,6 +534,7 @@ export function registerCleanView(on: On): void {
     if (e.agentId !== undefined) {
       // Helpers are never gated, but what they change still belongs on the receipt.
       pendingAsk = describeAsk(e)
+      pendingWho = "Claude's helper"
       const ran = await next(e)
       if (ran.deny === undefined && ran.isError !== true) {
         await change($, list => (isActiveJob(list) ? { ...list, changes: recordChange(changesOf(list), e, ran) } : list))
@@ -493,16 +545,26 @@ export function registerCleanView(on: On): void {
     if (!ALWAYS_ALLOWED.has(tool) && needsPlan(c) && (await read($, enabledAtom))) return { deny: GATE_MESSAGE }
     if (tool === 'AskUserQuestion') await change($, list => withNeedsYou(list, HAS_QUESTION))
     pendingAsk = describeAsk(e)
+    pendingWho = 'Claude'
+    const helperId = e.tool === 'Agent' ? (e.tool_use_id ?? e.description) : undefined
+    if (e.tool === 'Agent' && helperId !== undefined) {
+      const now = await $.clock.now()
+      await change($, list => addHelper(list, helperId, e.description, now))
+    }
     const ran = await next(e)
     const outcome = outcomeOf(ran, failStreak)
     failStreak = outcome.streak
-    await change($, list => afterTool(list, e, ran, outcome))
+    const now = await $.clock.now()
+    await change($, list => {
+      const settled = helperId === undefined ? list : settleHelper(list, helperId, ran, now)
+      return afterTool(settled, e, ran, outcome)
+    })
     return ran
   }).catch(($, e, next) => next(e))
 
   on('classic.Notification', async ($, e, next) => {
     const isPermission = e.notification_type === 'permission_prompt' || /permission/i.test(e.message)
-    const ask = `Claude needs your OK ${pendingAsk ?? 'to continue'}`
+    const ask = `${pendingWho} needs your OK ${pendingAsk ?? 'to continue'}`
     const reason = isPermission ? ask : e.notification_type === 'elicitation_dialog' ? HAS_QUESTION : null
     if (reason) await change($, c => withNeedsYou(c, reason))
     return next(e)
@@ -516,7 +578,11 @@ export function registerCleanView(on: On): void {
   })
 
   on('turn.complete', async ($, e, next) => {
-    if (e.agentId === undefined) {
+    const helperAgent = e.agentId
+    if (helperAgent !== undefined) {
+      const now = await $.clock.now()
+      await change($, list => finishHelper(list, helperAgent, e.reason, now))
+    } else {
       const now = await $.clock.now()
       const c = await change($, list => endTurn(list, e, now))
       lastErrorKind = undefined
@@ -570,9 +636,18 @@ export function registerCleanView(on: On): void {
     const receipt = receiptText(changes)
     const canShowChanges = showJob && c.phase !== 'working' && receipt !== ''
     const details = canShowChanges && c.isShowingChanges ? changeLines(changes) : []
+    // Finished helpers show under their step until that step is done; running ones always show.
+    // Ones started before any plan (or whose step is gone) show last.
+    const openTaskIds = new Set(c.tasks.filter(t => t.status !== 'done').map(t => t.id))
+    const taskIds = new Set(c.tasks.map(t => t.id))
+    const helpers = showRows
+      ? helpersOf(c)
+        .filter(x => x.status === 'working' || (x.taskId === null ? c.phase !== 'done' : openTaskIds.has(x.taskId)))
+        .map(x => (x.taskId !== null && !taskIds.has(x.taskId) ? { ...x, taskId: null } : x))
+      : []
     // A rounded card when there is room for it and something to frame; flat rows otherwise.
-    const rowsNeeded = 1 + (showOverall ? 1 : 0) + (showRows ? c.tasks.length : 0) + details.length
-    const hasFrame = (showRows && c.tasks.length > 0) || details.length > 0
+    const rowsNeeded = 1 + (showOverall ? 1 : 0) + (showRows ? c.tasks.length : 0) + helpers.length + details.length
+    const hasFrame = (showRows && (c.tasks.length > 0 || helpers.length > 0)) || details.length > 0
     const hasCard = hasFrame && rowsNeeded + 2 <= e.props.maxRows && e.props.bodyColumns >= 44
     const columns = Math.max(30, e.props.bodyColumns) - (hasCard ? 4 : 0)
     const headerColumns = columns - BUTTON_COLUMNS - (canShowChanges ? CHANGES_BUTTON_COLUMNS : 0)
@@ -620,6 +695,22 @@ export function registerCleanView(on: On): void {
     )
 
     const firstUpcoming = c.tasks.findIndex(t => t.status === 'upcoming')
+    // A helper's name spans the step-name and bar columns, so its status lines up with the step labels.
+    const helperColumns = nameColumns - 2 + 1 + METER
+    // Not named `h`: that name is the JSX factory.
+    const helperRow = (helper: CleanViewHelper) => {
+      const status = helper.status === 'working'
+        ? `working · ${formatDuration(now - helper.startedAt)}`
+        : helper.status === 'done' ? '✓ done' : "⚠ didn't finish"
+      const color = helper.status === 'working' ? 'cyan' : helper.status === 'done' ? 'green' : 'yellow'
+      return (
+        <Box flexDirection="row">
+          <Text dimColor>{'  ↳ '}</Text>
+          <Text dimColor={helper.status !== 'working'}>{`${fit(`Helper: ${helper.name}`, helperColumns)}  `}</Text>
+          <Text color={color} dimColor={helper.status === 'done'}>{status}</Text>
+        </Box>
+      )
+    }
     const overall = overallPercent(c)
     const lineColumns = Math.max(4, columns - 6)
     const lineFilled = Math.round((overall / 100) * lineColumns)
@@ -649,15 +740,19 @@ export function registerCleanView(on: On): void {
             const iconColor = isDone ? 'green' : isPaused ? 'yellow' : isActive ? 'cyan' : undefined
             const label = isDone ? 'Done' : isActive ? (t.hasReported ? `${t.percent}%` : 'Working') : i === firstUpcoming ? 'Next' : 'Up next'
             return (
-              <Box flexDirection="row">
-                <Text color={iconColor} bold={isActive} dimColor={!isDone && !isActive}>{`${icon} `}</Text>
-                <Text bold={isActive} dimColor={!isActive}>{`${fit(t.name, nameColumns)} `}</Text>
-                <Text color={isDone ? 'green' : isActive ? 'cyan' : undefined} dimColor={!isActive}>{meterFor(t, frame)}</Text>
-                <Text dimColor={!isActive}>{'  '}</Text>
-                <Text color={isDone ? 'green' : undefined} dimColor={!isActive} bold={isActive}>{label}</Text>
+              <Box flexDirection="column">
+                <Box flexDirection="row">
+                  <Text color={iconColor} bold={isActive} dimColor={!isDone && !isActive}>{`${icon} `}</Text>
+                  <Text bold={isActive} dimColor={!isActive}>{`${fit(t.name, nameColumns)} `}</Text>
+                  <Text color={isDone ? 'green' : isActive ? 'cyan' : undefined} dimColor={!isActive}>{meterFor(t, frame)}</Text>
+                  <Text dimColor={!isActive}>{'  '}</Text>
+                  <Text color={isDone ? 'green' : undefined} dimColor={!isActive} bold={isActive}>{label}</Text>
+                </Box>
+                {helpers.filter(h => h.taskId === t.id).map(helperRow)}
               </Box>
             )
           })}
+        {helpers.filter(h => h.taskId === null).map(helperRow)}
         {details.map(line => (
           <Text dimColor={line.isNote} wrap="truncate-end">{line.text}</Text>
         ))}
