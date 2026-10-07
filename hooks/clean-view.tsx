@@ -1,19 +1,23 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On, ToolCallInput, ToolCallResult, TurnCompleteInput } from 'claude-code'
 
-import type { CleanViewChecklist, CleanViewPhase, CleanViewTask, CleanViewTaskStatus } from '../types'
+import type { CleanViewChanges, CleanViewChecklist, CleanViewPhase, CleanViewTask, CleanViewTaskStatus } from '../types'
 
 type Engine = EngineInterface
 type Todo = { content: string; status: 'pending' | 'in_progress' | 'completed' }
 
 const PLAN_TOOL = 'mcp__clean-view__plan_steps'
 const PROGRESS_TOOL = 'mcp__clean-view__report_progress'
+// Looking around never needs a plan; only actions that change things do.
 const ALWAYS_ALLOWED = new Set([
-  'ToolSearch', 'TodoWrite', 'TaskCreate', 'TaskUpdate', 'AskUserQuestion', PLAN_TOOL, PROGRESS_TOOL,
+  'ToolSearch', 'TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet', 'AskUserQuestion', 'Skill',
+  'Read', 'Glob', 'Grep', 'LS', 'WebFetch', 'WebSearch', PLAN_TOOL, PROGRESS_TOOL,
 ])
+const MAX_LISTED_CHANGES = 8
 const METER = 10
 const MAX_NAME = 40
 const BUTTON_COLUMNS = 22
+const CHANGES_BUTTON_COLUMNS = 17
 const COLLAPSE_MS = 5000
 const FAILS_BEFORE_STUCK = 3
 
@@ -28,9 +32,12 @@ const GATE_MESSAGE =
   `Clean View: call ${PLAN_TOOL} first to lay out the steps of this job in plain English ` +
   '(load it with ToolSearch if it is deferred), then try this again.'
 
+const NO_CHANGES: CleanViewChanges = { edited: [], created: [], commands: 0 }
+
 const IDLE: CleanViewChecklist = {
   title: '', phase: 'idle', tasks: [], needsYouReason: null, stuckReason: null,
   startedAt: null, finishedAt: null, isCollapsed: false, isPlanned: false,
+  changes: NO_CHANGES, isShowingChanges: false,
 }
 
 const enabledAtom = atom({ plugin: 'clean-view', key: 'cleanViewEnabled' } as const, true)
@@ -41,6 +48,8 @@ const tickAtom = atom({ plugin: 'clean-view', key: 'tick' } as const, 0)
 let ticker: { cancel: () => void } | undefined
 let failStreak = 0
 let lastErrorKind: string | undefined
+/** What the newest running tool call would do, in plain words, for a permission prompt it raises. */
+let pendingAsk: string | undefined
 
 // ---------- plain names ----------
 
@@ -96,17 +105,9 @@ function settle(tasks: CleanViewTask[]): CleanViewTask[] {
   })
 }
 
-function newJob(now: number): CleanViewChecklist {
-  return {
-    ...IDLE,
-    title: 'Your request',
-    phase: 'working',
-    startedAt: now,
-    tasks: [
-      makeTask('placeholder-0', 'Understand your request', 'active'),
-      makeTask('placeholder-1', 'Plan the steps', 'upcoming'),
-    ],
-  }
+/** A job starts as one quiet line; steps appear only once Claude plans real work. */
+function newJob(now: number, title = 'Your request'): CleanViewChecklist {
+  return { ...IDLE, title, phase: 'working', startedAt: now }
 }
 
 const isActiveJob = (c: CleanViewChecklist): boolean =>
@@ -119,12 +120,13 @@ function startTurn(c: CleanViewChecklist, text: string, now: number): CleanViewC
   const isReply = c.phase === 'needs-you' && c.isPlanned && hasUnfinished(c)
   if (isReply) return { ...c, phase: 'working', needsYouReason: null, stuckReason: null, finishedAt: null }
   if (prompt === '' || prompt.startsWith('/')) return c
-  return newJob(now)
+  const title = shortTitle(prompt)
+  return newJob(now, title === 'Working on it' ? 'Your request' : title)
 }
 
 export function applyPlan(c: CleanViewChecklist, names: readonly string[], now: number): CleanViewChecklist {
   // A plan laid after a job ended (done, stopped) starts a fresh one rather than a list stuck on "All done".
-  const base = isActiveJob(c) ? c : newJob(now)
+  const base = isActiveJob(c) ? c : newJob(now, c.title || undefined)
   const tasks = names.slice(0, 8).map((name, i) => makeTask(`step-${i}`, name, 'upcoming'))
   return { ...base, isPlanned: true, tasks: settle(tasks) }
 }
@@ -203,6 +205,8 @@ function endTurn(c: CleanViewChecklist, e: TurnCompleteInput, now: number): Clea
   if (c.isPlanned && hasUnfinished(c)) {
     return { ...c, phase: 'needs-you', needsYouReason: WAITING_REPLY, stuckReason: null }
   }
+  // A quick answer that changed nothing ends like normal chat: no card at all.
+  if (!c.isPlanned && !hasChanges(changesOf(c))) return IDLE
   const tasks = c.tasks.map((t): CleanViewTask => ({ ...t, status: 'done', percent: 100, hasReported: true }))
   return { ...ended, phase: 'done', stuckReason: null, isCollapsed: false, tasks }
 }
@@ -215,9 +219,77 @@ function outcomeOf(ran: ToolCallResult, streak: number): Outcome {
   return { failed, saidNo, streak: failed && !saidNo ? streak + 1 : 0 }
 }
 
+// ---------- the "what changed" receipt ----------
+
+/** State written before this field existed (it survives reloads) reads as no changes. */
+const changesOf = (c: CleanViewChecklist): CleanViewChanges => c.changes ?? NO_CHANGES
+
+const hasChanges = (ch: CleanViewChanges): boolean => ch.edited.length + ch.created.length + ch.commands > 0
+
+const fileName = (path: unknown): string => String(path ?? '').split(/[/\\]/).pop() || 'a file'
+
+const plural = (n: number, one: string, many: string): string => `${n} ${n === 1 ? one : many}`
+
+function recordChange(ch: CleanViewChanges, e: ToolCallInput, ran: ToolCallResult): CleanViewChanges {
+  const add = (list: string[], name: string): string[] => (list.includes(name) ? list : [...list, name])
+  if (e.tool === 'Edit' || e.tool === 'NotebookEdit') {
+    const name = fileName(e.tool === 'Edit' ? e.file_path : e.notebook_path)
+    return ch.created.includes(name) ? ch : { ...ch, edited: add(ch.edited, name) }
+  }
+  if (e.tool === 'Write') {
+    const name = fileName(e.file_path)
+    const isNew = (ran.result as { type?: string } | undefined)?.type === 'create'
+    return isNew ? { ...ch, created: add(ch.created, name) } : { ...ch, edited: add(ch.edited, name) }
+  }
+  if (e.tool === 'Bash') return { ...ch, commands: ch.commands + 1 }
+  return ch
+}
+
+/** The "Show changes" list: each file by name, and an honest note about what can't be seen. */
+function changeLines(ch: CleanViewChanges): { text: string; isNote: boolean }[] {
+  const files = [
+    ...ch.created.map(name => ({ text: `+ created ${name}`, isNote: false })),
+    ...ch.edited.map(name => ({ text: `✎ changed ${name}`, isNote: false })),
+  ]
+  const hidden = files.length - MAX_LISTED_CHANGES
+  return [
+    ...files.slice(0, MAX_LISTED_CHANGES),
+    ...(hidden > 0 ? [{ text: `  and ${plural(hidden, 'more file', 'more files')}`, isNote: true }] : []),
+    ...(ch.commands > 0
+      ? [{ text: `Ran ${plural(ch.commands, 'command', 'commands')}: commands can change things this list can't show.`, isNote: true }]
+      : []),
+  ]
+}
+
+/** "changed 3 files · created 1 · ran 2 commands", counted from the tool calls, never guessed. */
+export function receiptText(ch: CleanViewChanges): string {
+  const parts = [
+    ch.edited.length > 0 ? `changed ${plural(ch.edited.length, 'file', 'files')}` : '',
+    ch.created.length > 0 ? `created ${plural(ch.created.length, 'file', 'files')}` : '',
+    ch.commands > 0 ? `ran ${plural(ch.commands, 'command', 'commands')}` : '',
+  ]
+  return parts.filter(Boolean).join(' · ')
+}
+
+/** What a tool call would do, for "Claude needs your OK …", from a fixed table (no model call). */
+export function describeAsk(e: ToolCallInput): string {
+  if (e.tool === 'Edit') return `to change ${fileName(e.file_path)}`
+  if (e.tool === 'NotebookEdit') return `to change ${fileName(e.notebook_path)}`
+  if (e.tool === 'Write') return `to save ${fileName(e.file_path)}`
+  if (e.tool === 'Bash') {
+    if (/\b(rm|rmdir|unlink|trash|shred)\b/.test(e.command)) return 'to delete something'
+    if (/\b(git push|npm publish|curl|wget|scp|rsync)\b/.test(e.command)) return 'to send or fetch something online'
+    if (/\b(npm|pnpm|yarn|pip|brew|cargo) (i|install|add)\b/.test(e.command)) return 'to install something'
+    return 'to run a command'
+  }
+  if (e.tool === 'WebFetch' || e.tool === 'WebSearch') return 'to look something up online'
+  if (e.tool === 'Agent') return 'to start a helper'
+  return 'to continue'
+}
+
 function afterTool(c: CleanViewChecklist, e: ToolCallInput, ran: ToolCallResult, { failed, saidNo, streak }: Outcome): CleanViewChecklist {
   if (!isActiveJob(c)) return c
-  let next = c
+  let next = failed ? c : { ...c, changes: recordChange(changesOf(c), e, ran) }
   if (!failed && e.tool === 'TodoWrite') next = applyTodos(next, e.todos)
   if (!failed && e.tool === 'TaskCreate') {
     const id = (ran.result as { task?: { id?: string } } | undefined)?.task?.id
@@ -259,30 +331,13 @@ async function setEnabled($: Engine, isEnabled: boolean): Promise<void> {
   $.ui.toast(isEnabled ? 'Clean View is on: technical details are hidden' : 'Clean View is off: every step is shown in full')
 }
 
-async function nameJob($: Engine, prompt: string, jobId: number): Promise<void> {
-  try {
-    const answer = await $.model.complete({
-      model: 'haiku',
-      effort: 'low',
-      maxTokens: 40,
-      timeoutMs: 15000,
-      system: 'You name jobs for a progress checklist. Reply with the name only.',
-      prompt: `Name this request in 2 to 6 plain words a non-technical person understands, starting with a verb. No file names, paths, code or quotes.\n\nRequest:\n${prompt.slice(0, 2000)}`,
-    })
-    if (!answer.isAnswered) return
-    const title = shortTitle(answer.text)
-    if (title !== 'Working on it') await change($, c => (c.startedAt === jobId ? { ...c, title } : c))
-  } catch {
-    // ponytail: the placeholder title stays; naming is cosmetic.
-  }
-}
-
 function guideText(tools: readonly string[]): string {
   const hasTodos = tools.includes('TodoWrite') || tools.includes('TaskCreate')
   return [
     '# Clean View',
     'Clean View is on. The person using this session is not technical: instead of tool calls they see a plain checklist of your steps.',
-    `- For every request, even a quick question, call ${PLAN_TOOL} first with every step of the job in order (2 to 8 steps). If it is deferred, load it with ToolSearch first. Other tools are blocked until a plan exists.`,
+    '- A quick answer that needs no actions needs no plan: just answer. Reading and looking things up never need one.',
+    `- Before anything that changes things (editing or creating files, running commands, starting helpers), call ${PLAN_TOOL} with every step of the job in order (2 to 8 steps). If it is deferred, load it with ToolSearch first. Those actions are blocked until a plan exists.`,
     '- Write every step name in plain English a non-technical person understands. Keep it under 40 characters and start it with a verb, like "Build the pricing section".',
     '- Never put file paths, file names, commands, code or tool names in a step name.',
     `- Call ${PROGRESS_TOOL} with the step name and a percent as real progress happens, and with 100 the moment a step finishes.`,
@@ -293,7 +348,7 @@ function guideText(tools: readonly string[]): string {
 const PLAN_SPEC = {
   name: 'plan_steps',
   description:
-    'Lay out every step of the job up front, before any other tool: 2 to 8 short plain-English step names in order, ' +
+    'Lay out every step of the job up front, before any action that changes things: 2 to 8 short plain-English step names in order, ' +
     'each under 40 characters and starting with a verb ("Build the pricing section"). No file paths, file names, ' +
     'commands, code or tool names. The first step starts right away.',
   inputSchema: {
@@ -401,7 +456,7 @@ export function registerCleanView(on: On): void {
     const after = await change($, c => startTurn(c, e.text, now))
     failStreak = 0
     lastErrorKind = undefined
-    if (after.startedAt !== before.startedAt && (await read($, enabledAtom))) void nameJob($, e.text, now)
+    pendingAsk = undefined
     return next(e)
   })
 
@@ -424,10 +479,20 @@ export function registerCleanView(on: On): void {
   // ponytail: fails open; a broken checklist must never block real work.
   on('tool.call', async ($, e, next) => {
     const tool = String(e.tool)
-    if (e.agentId !== undefined || tool === PLAN_TOOL || tool === PROGRESS_TOOL) return next(e)
+    if (tool === PLAN_TOOL || tool === PROGRESS_TOOL) return next(e)
+    if (e.agentId !== undefined) {
+      // Helpers are never gated, but what they change still belongs on the receipt.
+      pendingAsk = describeAsk(e)
+      const ran = await next(e)
+      if (ran.deny === undefined && ran.isError !== true) {
+        await change($, list => (isActiveJob(list) ? { ...list, changes: recordChange(changesOf(list), e, ran) } : list))
+      }
+      return ran
+    }
     const c = await read($, checklistAtom)
     if (!ALWAYS_ALLOWED.has(tool) && needsPlan(c) && (await read($, enabledAtom))) return { deny: GATE_MESSAGE }
     if (tool === 'AskUserQuestion') await change($, list => withNeedsYou(list, HAS_QUESTION))
+    pendingAsk = describeAsk(e)
     const ran = await next(e)
     const outcome = outcomeOf(ran, failStreak)
     failStreak = outcome.streak
@@ -437,7 +502,8 @@ export function registerCleanView(on: On): void {
 
   on('classic.Notification', async ($, e, next) => {
     const isPermission = e.notification_type === 'permission_prompt' || /permission/i.test(e.message)
-    const reason = isPermission ? NEEDS_OK : e.notification_type === 'elicitation_dialog' ? HAS_QUESTION : null
+    const ask = `Claude needs your OK ${pendingAsk ?? 'to continue'}`
+    const reason = isPermission ? ask : e.notification_type === 'elicitation_dialog' ? HAS_QUESTION : null
     if (reason) await change($, c => withNeedsYou(c, reason))
     return next(e)
   })
@@ -500,11 +566,16 @@ export function registerCleanView(on: On): void {
     const showJob = isEnabled && c.phase !== 'idle'
     const showRows = showJob && !(c.phase === 'done' && c.isCollapsed)
     const showOverall = showRows && c.isPlanned
-    // A rounded card when there is room for it; flat rows on a short or narrow band.
-    const rowsNeeded = 1 + (showOverall ? 1 : 0) + (showRows ? c.tasks.length : 0)
-    const hasCard = showRows && rowsNeeded + 2 <= e.props.maxRows && e.props.bodyColumns >= 44
+    const changes = changesOf(c)
+    const receipt = receiptText(changes)
+    const canShowChanges = showJob && c.phase !== 'working' && receipt !== ''
+    const details = canShowChanges && c.isShowingChanges ? changeLines(changes) : []
+    // A rounded card when there is room for it and something to frame; flat rows otherwise.
+    const rowsNeeded = 1 + (showOverall ? 1 : 0) + (showRows ? c.tasks.length : 0) + details.length
+    const hasFrame = (showRows && c.tasks.length > 0) || details.length > 0
+    const hasCard = hasFrame && rowsNeeded + 2 <= e.props.maxRows && e.props.bodyColumns >= 44
     const columns = Math.max(30, e.props.bodyColumns) - (hasCard ? 4 : 0)
-    const headerColumns = columns - BUTTON_COLUMNS
+    const headerColumns = columns - BUTTON_COLUMNS - (canShowChanges ? CHANGES_BUTTON_COLUMNS : 0)
     // Names column as wide as the longest name, so each bar sits right beside its step.
     const longestName = Math.max(0, ...c.tasks.map(t => t.name.length))
     const nameColumns = Math.max(6, Math.min(longestName, columns - 2 - 1 - METER - 2 - 7))
@@ -516,6 +587,14 @@ export function registerCleanView(on: On): void {
         key="clean-view-toggle"
         label={isEnabled ? '● Clean View: ON' : '○ Clean View: OFF'}
         onPress={async () => setEnabled($, !(await read($, enabledAtom)))}
+      />
+    )
+
+    const changesButton = canShowChanges && (
+      <Button
+        key="clean-view-changes"
+        label={c.isShowingChanges ? 'Hide changes' : 'Show changes'}
+        onPress={() => change($, list => ({ ...list, isShowingChanges: !list.isShowingChanges }))}
       />
     )
 
@@ -531,10 +610,10 @@ export function registerCleanView(on: On): void {
     ) : c.phase === 'stopped' ? (
       <Text wrap="truncate-end">■ Stopped · {c.title} · you pressed Esc</Text>
     ) : c.phase === 'done' ? (
-      <Text color="green" wrap="truncate-end">✓ All done · {c.title} · took {elapsed}</Text>
+      <Text color="green" wrap="truncate-end">✓ All done · {c.title} · took {elapsed}{receipt ? ` · ${receipt}` : ''}</Text>
     ) : (
       <Box flexDirection="row">
-        <Text color={accent} bold dimColor={frame % 4 >= 2}>● </Text>
+        <Text color={accent} bold>● </Text>
         <Text bold wrap="truncate-end">{c.title}</Text>
         <Text dimColor>{stepCount(c)} · {elapsed}</Text>
       </Box>
@@ -549,7 +628,10 @@ export function registerCleanView(on: On): void {
       <Box flexDirection="column">
         <Box flexDirection="row" justifyContent="space-between">
           <Box width={headerColumns} flexShrink={1}>{header}</Box>
-          {toggle}
+          <Box flexDirection="row" gap={1}>
+            {changesButton}
+            {toggle}
+          </Box>
         </Box>
         {showOverall && (
           <Box flexDirection="row">
@@ -576,6 +658,9 @@ export function registerCleanView(on: On): void {
               </Box>
             )
           })}
+        {details.map(line => (
+          <Text dimColor={line.isNote} wrap="truncate-end">{line.text}</Text>
+        ))}
       </Box>
     )
 

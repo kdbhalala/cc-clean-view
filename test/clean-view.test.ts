@@ -18,15 +18,10 @@ const BAND = {
 
 type ToolAnswer = { result: unknown; isError?: true; text?: string }
 
-/** The engine beneath the plugin: a store and clock in memory, tools that succeed, a Haiku that names jobs. */
-function world(on: On, tools: () => ToolAnswer = () => ({ result: 'ok' })) {
+/** The engine beneath the plugin: a store and clock in memory, and tools that succeed unless told otherwise. */
+function world(on: On, tools: () => ToolAnswer | Promise<ToolAnswer> = () => ({ result: 'ok' })) {
   mock.store(on)
   const clock = mock.clock(on, { now: 1_000_000 })
-  on('model.complete', () => ({ value: {
-    isAnswered: true,
-    text: 'Build my landing page',
-    usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
-  } }))
   on('ui.toast', () => ({ value: undefined }))
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
@@ -106,7 +101,7 @@ test('/simple off hides the band but keeps the button, and tool rows come back',
     command: 'simple', args: 'off', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 100 },
   })
   const ui = await $.ui.mount(band('terminal'))
-  expect(await ui.find({ text: /Understand your request/ })).toBeUndefined()
+  expect(await ui.find({ text: /Build my landing page/ })).toBeUndefined()
   expect((await ui.find({ type: 'Button' }))?.props.label).toBe('○ Clean View: OFF')
 })
 
@@ -211,4 +206,50 @@ test('the card frames the job, shows overall progress and fine-grained bars, and
   }
   const short = await $.ui.mount({ ...band('terminal'), props: { ...BAND, maxRows: 4 } })
   expect(await short.drawn()).not.toMatchObject({ props: { borderStyle: 'round' } })
+})
+
+test('a quick answer needs no plan, may look things up, and leaves no card behind', async ($, on) => {
+  world(on)
+  await $.turn.start({ text: 'What does this spreadsheet say about March?', turnId: 't1' })
+  const looked = await $.tool.call({ tool: 'Read', file_path: '/Users/me/budget.xlsx' })
+  expect(looked.result).toBe('ok')
+  await $.turn.complete(endTurn('answer'))
+  const ui = await $.ui.mount(band('terminal'))
+  expect(await ui.find({ type: 'Text', text: /All done/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'clean-view-toggle' })).toBeDefined()
+})
+
+test('the receipt counts what really changed and lists it on request', async ($, on) => {
+  let answer: ToolAnswer = { result: 'ok' }
+  world(on, () => answer)
+  await startPlanned($)
+  answer = { result: { type: 'create' } }
+  await $.tool.call({ tool: 'Write', file_path: '/Users/me/site/contact.html', content: '<form>' })
+  answer = { result: 'ok' }
+  await $.tool.call({ tool: 'Edit', file_path: '/Users/me/site/pricing.html', old_string: 'a', new_string: 'b' })
+  await $.tool.call({ tool: 'Bash', command: 'npm run build' })
+  await $.tool.call({ tool: PROGRESS, task: 'Add the contact form', percent: 100 })
+  await $.turn.complete(endTurn('answer'))
+  const ui = await $.ui.mount(band('terminal'))
+  expect(await ui.find({ type: 'Text', text: /changed 1 file · created 1 file · ran 1 command/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /created contact.html/ })).toBeUndefined()
+  await ui.press({ key: 'clean-view-changes' })
+  expect(await ui.find({ type: 'Text', text: '+ created contact.html' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '✎ changed pricing.html' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /commands can change things this list can't show/ })).toBeDefined()
+})
+
+test('Needs you says what the OK is for', async ($, on) => {
+  let release = () => {}
+  const held = new Promise<ToolAnswer>(resolve => { release = () => resolve({ result: 'ok' }) })
+  const clock = world(on, () => held)
+  await startPlanned($)
+  const call = $.tool.call({ tool: 'Bash', command: 'rm -rf old-photos' })
+  await clock.settle()
+  await $.classic.Notification({ message: 'Claude needs your permission to use Bash', notification_type: 'permission_prompt' })
+  const ui = await $.ui.mount(band('terminal'))
+  expect(await ui.find({ type: 'Text', text: / Claude needs your OK to delete something/ })).toBeDefined()
+  release()
+  await call
+  expect(await ui.find({ type: 'Text', text: /Needs you/ })).toBeUndefined()
 })
