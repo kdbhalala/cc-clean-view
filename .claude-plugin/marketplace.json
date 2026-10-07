@@ -1,0 +1,13 @@
+{
+  "name": "clean-view",
+  "description": "Clean View: a calm, plain-English checklist for Claude Code that hides the technical clutter.",
+  "owner": {
+    "name": "kdbhalala"
+  },
+  "plugins": [
+    {
+      "name": "clean-view",
+      "source": "./"
+    }
+  ]
+}

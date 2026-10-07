@@ -1,0 +1,11 @@
+{
+  "name": "clean-view",
+  "version": "0.1.0",
+  "description": "A calm, plain-English checklist above the prompt; hides tool calls, diffs and command output while Claude works.",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "kdbhalala"
+  },
+  "homepage": "https://github.com/kdbhalala/cc-clean-view",
+  "repository": "https://github.com/kdbhalala/cc-clean-view"
+}

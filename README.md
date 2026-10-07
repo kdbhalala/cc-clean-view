@@ -1,0 +1,38 @@
+# Clean View
+
+Makes Claude Code calm and friendly for people who aren't technical. While Claude works, tool calls, file
+changes and command output are hidden, and one plain checklist sits above the prompt:
+
+```
+╭──────────────────────────────────────────────────────────────────────╮
+│ ● Build my landing page · step 2 of 4 · 1m 12s  [ ● Clean View: ON ] │
+│ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━──────────────────────  41%  │
+│ ✓ Read your brand notes      ██████████  Done                        │
+│ ▶ Build the pricing section  ██████▍░░░  64%                         │
+│ ○ Add the contact form       ░░░░░░░░░░  Next                        │
+│ ○ Polish the footer          ░░░░░░░░░░  Up next                     │
+╰──────────────────────────────────────────────────────────────────────╯
+```
+
+## Install
+
+In a Claude Code terminal session:
+
+```
+/plugin install clean-view --marketplace kdbhalala/cc-clean-view
+```
+
+Answer `y` to add the marketplace, then press Enter to install for your user.
+
+## Use
+
+- Click **[ ● Clean View: ON ]** above the prompt, or type `/simple on`, `/simple off`, or `/simple` to flip it.
+- It starts on and remembers your choice.
+- When it's off, every technical row comes back and Claude no longer has to plan first.
+
+## Develop
+
+```
+claude plugin validate .
+claude plugin test .
+```
